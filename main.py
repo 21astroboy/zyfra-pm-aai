@@ -1,14 +1,18 @@
 import requests
-from telebot import TeleBot, types
+from telebot import TeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import json
 import bcrypt
 import psycopg2
+import schedule
+import time
+from threading import Thread
 
 TOKEN = '7312237819:AAE50V0ZEVyATIyE53BPNZnkMpZP6GmDc9U'
 bot = TeleBot(TOKEN)
 jira_token = "pTogIaHA7YRm6cNDuEWoJVC4Omj373namjqDKh"
 JIRA_URL = 'https://jira.zyfra.com'
+DEFAULT_PASSWORD = "#tSfoNtyQa$r"
 
 # Хранение сессий пользователей
 user_sessions = {}
@@ -38,6 +42,71 @@ def check_password(mail, provided_password):
     stored_hashed_password = result[0]
     return bcrypt.checkpw(provided_password.encode('utf-8'), stored_hashed_password.encode('utf-8'))
 
+def get_all_project_managers():
+    url = f"{JIRA_URL}/rest/api/2/search"
+    jql_query = 'issuetype=Epic AND project="DP00001" ORDER BY duedate'
+    params = {
+        "jql": jql_query,
+        "maxResults": 15000
+    }
+    headers = {
+        "Authorization": f"Bearer {jira_token}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.get(url, params=params, headers=headers)
+        response.raise_for_status()
+        json_data = response.json()
+
+        issues = json_data.get('issues', [])
+        project_managers = {
+            issue['fields']['customfield_12911']['emailAddress']
+            for issue in issues
+            if 'fields' in issue and 'customfield_12911' in issue['fields'] and issue['fields']['customfield_12911']
+        }
+        return project_managers
+    except requests.exceptions.RequestException as err:
+        print(f"Ошибка запроса: {err}")
+        return set()
+
+def update_project_managers():
+    project_managers = get_all_project_managers()
+    if not project_managers:
+        return
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    for email in project_managers:
+        select_query = """
+        SELECT COUNT(*) FROM project_managers WHERE mail = %s
+        """
+        cursor.execute(select_query, (email,))
+        count = cursor.fetchone()[0]
+
+        if count == 0:
+            hashed_password = bcrypt.hashpw(DEFAULT_PASSWORD.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+            insert_query = """
+            INSERT INTO project_managers (mail, password) VALUES (%s, %s)
+            """
+            cursor.execute(insert_query, (email, hashed_password))
+            conn.commit()
+
+    cursor.close()
+    conn.close()
+
+schedule.every().hour.do(update_project_managers)
+
+def run_schedule():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+schedule_thread = Thread(target=run_schedule)
+schedule_thread.daemon = True
+schedule_thread.start()
+
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     bot.reply_to(message, "Привет! Пожалуйста, авторизуйтесь для начала работы. Введите вашу почту:")
@@ -54,20 +123,31 @@ def ask_for_password(message):
 
     if check_password(email, password):
         user_sessions[message.chat.id]['password'] = password
-        bot.reply_to(message, "Авторизация успешна! Теперь вы можете использовать команду /get_all для получения всех задач.")
+        bot.reply_to(message, "Авторизация успешна! Введите почту проектного менеджера, чьи проекты вы хотите увидеть:")
+        # Удаляем сообщение с паролем
+        bot.delete_message(message.chat.id, message.message_id)
     else:
         user_sessions.pop(message.chat.id, None)
         bot.reply_to(message, "Неверная почта или пароль. Попробуйте снова, введите вашу почту:")
 
-@bot.message_handler(commands=['get_all'])
+@bot.message_handler(func=lambda message: message.chat.id in user_sessions and 'password' in user_sessions[message.chat.id] and 'manager_email' not in user_sessions[message.chat.id])
+def ask_for_manager_email(message):
+    user_sessions[message.chat.id]['manager_email'] = message.text
+    bot.reply_to(message, "Теперь вы можете использовать команду /get_projects для получения всех задач.")
+
+@bot.message_handler(commands=['get_projects'])
 def get_all_issues(message):
     if message.chat.id not in user_sessions or 'email' not in user_sessions[message.chat.id] or 'password' not in user_sessions[message.chat.id]:
         bot.reply_to(message, "Пожалуйста, сначала авторизуйтесь. Введите вашу почту:")
         return
 
-    user_email = user_sessions[message.chat.id]['email']
+    if 'manager_email' not in user_sessions[message.chat.id]:
+        bot.reply_to(message, "Пожалуйста, введите почту проектного менеджера, чьи проекты вы хотите увидеть.")
+        return
+
+    manager_email = user_sessions[message.chat.id]['manager_email']
     url = f"{JIRA_URL}/rest/api/2/search"
-    jql_query = 'issuetype=Epic AND project="DP00001" ORDER BY duedate'
+    jql_query = f'issuetype=Epic AND project="DP00001" ORDER BY duedate'
     params = {
         "jql": jql_query,
         "maxResults": 5000
@@ -83,17 +163,18 @@ def get_all_issues(message):
         json_data = response.json()
 
         issues = json_data.get('issues', [])
-        project_issues = [
-            issue['key'] for issue in issues
-            if 'fields' in issue and 'customfield_12911' in issue['fields'] and
-               issue['fields']['customfield_12911'] and
-               issue['fields']['customfield_12911']['emailAddress'] == user_email
+        filtered_issues = [
+            (issue['fields']['summary'], issue['key']) for issue in issues
+            if 'fields' in issue and 'customfield_12911' in issue['fields']
+            and issue['fields']['customfield_12911'] and issue['fields']['customfield_12911']['emailAddress'] == manager_email
         ][:9]
 
-        if project_issues:
+        if filtered_issues:
             markup = InlineKeyboardMarkup()
-            for issue_key in project_issues:
-                markup.add(InlineKeyboardButton(issue_key, callback_data=f'issue_{issue_key}'))
+            for summary, issue_key in filtered_issues:
+                project_name, project_number = summary.split(' - ')[0], issue_key.split('-')[-1]
+                button_text = f"{project_name} ({project_number})"
+                markup.add(InlineKeyboardButton(button_text, callback_data=f'issue_{issue_key}'))
             bot.send_message(message.chat.id, "Выберите задачу:", reply_markup=markup)
         else:
             bot.send_message(message.chat.id, "Задачи не найдены.")
@@ -146,5 +227,11 @@ def get_issue_by_key(message, issue_key):
         bot.send_message(message.chat.id, f"Ошибка при выполнении запроса: {e}")
     except json.JSONDecodeError:
         bot.send_message(message.chat.id, "Ошибка при декодировании JSON.")
+
+@bot.message_handler(commands=['unauthorize'])
+def unauthorize(message):
+    if message.chat.id in user_sessions:
+        user_sessions.pop(message.chat.id, None)
+        bot.reply_to(message, "Вы вышли из системы. Введите вашу почту, чтобы авторизоваться снова.")
 
 bot.polling()
